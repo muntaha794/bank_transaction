@@ -1,220 +1,444 @@
-# Bank Transaction Ledger — Backend
+# Bank Transaction Ledger
 
-A double-entry bookkeeping backend: users hold one or more accounts, balances
-are derived from an append-only ledger (never a stored `balance` field), and
-transfers are atomic, idempotent, and auditable.
+A production-oriented banking backend built on **double-entry bookkeeping**. Users hold multiple accounts, money moves between them through atomic and idempotent transfers, and every movement is recorded in an append-only ledger. The project ships with JWT authentication (access + rotating refresh tokens), real-time notifications, interactive API documentation, and a lightweight demo console.
 
-## ⚠️ Rotate your credentials first
+---
 
-The `.env` file in the original project had **real, live secrets** committed
-to it in plain text: a MongoDB Atlas connection string with password, a JWT
-signing secret, and a Google OAuth client secret. Treat all of them as
-compromised and rotate them now, regardless of what you do with this project:
+## Table of Contents
 
-- MongoDB Atlas → Database Access → edit the user → reset password
-- Google Cloud Console → APIs & Services → Credentials → regenerate the OAuth client secret
-- Generate a fresh `JWT_SECRET` (e.g. `openssl rand -hex 32`)
+- [Features](#features)
+- [Tech Stack](#tech-stack)
+- [Project Structure](#project-structure)
+- [Installation Guide](#installation-guide)
+- [Environment Variables Setup](#environment-variables-setup)
+- [API Documentation](#api-documentation)
+- [Security Notes](#security-notes)
+- [Deployment](#deployment)
 
-This repo now uses `.env.example` (placeholders only) and a `.gitignore` that
-excludes `.env`, so this shouldn't happen again as long as you keep using it.
+---
 
-## What was fixed
+## Features
 
-The original code had several bugs that would crash the server on boot or
-silently break core functionality. The most serious:
+**Accounts & Ledger**
+- Multiple accounts per user, each with its own status (`ACTIVE`, `FROZEN`, `CLOSED`) and currency
+- Double-entry ledger: every transfer writes a matching `DEBIT` and `CREDIT` entry
+- Append-only ledger entries (update and delete operations are blocked at the model level)
+- Cached account balances updated atomically, with a reconciliation utility that recomputes balances from the ledger
 
-- **Login never checked the password.** Any request with a registered email
-  and *any* password succeeded.
-- `authMiddleware` referenced an unimported model and read `decoded.id` from
-  a JWT that was signed with `userId` — auth never actually worked.
-- A model exported a variable name that didn't match what it declared (a
-  `ReferenceError` on the very first `require`).
-- A hardcoded ~100 second `sleep()` inside every transaction.
-- The balance check read a field (`.balance`) that doesn't exist on the
-  account model instead of checking `.status`.
-- Several syntax errors (duplicate imports, a stray character, a missing
-  brace, `function` written as `const fn(){}`) that would throw immediately.
-- No refresh tokens — sessions had no way to renew without logging in again.
+**Transfers**
+- Atomic peer-to-peer transfers using MongoDB multi-document transactions
+- Concurrency-safe balance checks (check-and-debit performed as a single atomic operation)
+- Idempotent requests via `idempotencyKey`, scoped per user, with request-payload validation
+- System deposits and a development-only sandbox top-up
+- Rule-based flagging of unusually large transfers for review
+- Paginated transaction history, per-account statements, and CSV export
 
-See the diffs for the full list; every controller, model, and middleware
-file was rewritten.
+**Authentication**
+- Email/password registration and login
+- Short-lived access tokens with long-lived, **rotating refresh tokens**
+- Refresh-token reuse detection that revokes the entire session family
+- Logout with refresh-token revocation and access-token blacklisting
+- Optional email notifications (welcome, sign-in alert, transaction receipts)
 
-## What was added
+**Platform**
+- Real-time events over Socket.IO (`transaction:completed`, `transaction:received`)
+- Interactive OpenAPI (Swagger) documentation
+- Request validation, centralized error handling, and request-ID tracing
+- Structured JSON logging, health endpoint, and graceful shutdown
+- Dockerfile for containerized deployment
+- Built-in demo console (plain HTML/CSS/JS) that exercises the full flow
 
-- **Access + refresh token auth**, with refresh-token **rotation and reuse
-  detection**: each refresh token can be used exactly once; using an
-  already-used one revokes the entire session family and forces re-login
-  (the standard mitigation for a stolen refresh token).
-- Request validation (`zod`), centralized error handling, rate limiting on
-  auth routes, security headers (`helmet`), and NoSQL-injection sanitization.
-- Idempotent transfers with correct semantics: replaying the same
-  `idempotencyKey` returns the original result instead of erroring or double-spending.
-- A `/api/transactions/deposits` (system-only) and `/api/transactions/sandbox-topup`
-  (dev-only, any user) endpoint, so accounts can actually be funded — the
-  original code had this half-built and commented out.
-- Transaction history with pagination + filtering, per-account statements, and CSV export.
-- Simple rule-based fraud flagging (large transfers are flagged for review, not blocked).
-- Real-time updates over Socket.io (`transaction:completed` / `transaction:received`).
-- Structured logging (`pino`), request IDs, graceful shutdown, a `/health` endpoint.
-- Interactive API docs at `/api/docs` (OpenAPI/Swagger).
-- A small static demo UI (see below).
-- A `Dockerfile` for deployment.
+---
 
-## Do you need a UI to deploy this?
+## Tech Stack
 
-No — this is a backend API, and it works fine with zero UI: hit it with
-`curl`, Postman/Insomnia, or a mobile/web client you build separately.
-`/api/docs` also gives you a browsable, try-it-out UI for the API itself
-with no extra code.
+| Layer | Technology |
+|-------|------------|
+| Runtime | Node.js 18+ |
+| Framework | Express 5 |
+| Database | MongoDB with Mongoose (replica set required for transactions) |
+| Authentication | JSON Web Tokens, bcryptjs, HTTP-only cookies |
+| Validation | Zod |
+| Real-time | Socket.IO |
+| Security | Helmet, CORS, express-rate-limit, input sanitization |
+| Logging | Pino, pino-http |
+| API Docs | OpenAPI 3 via swagger-ui-express |
+| Email | Nodemailer (Gmail OAuth2) |
+| Tooling | Nodemon, Docker |
+| Demo UI | Vanilla HTML, CSS, JavaScript |
 
-That said, you asked to showcase the functions you built, so `/public`
-contains a small dependency-free demo frontend (plain HTML/CSS/JS, no
-build step) that exercises the whole flow: register/login, silent token
-refresh, create accounts, sandbox top-up, transfer money, watch the ledger
-update live. It's served automatically by the same Express app at `/`.
-Delete the `public/` folder and the `express.static(...)` line in `src/app.js`
-any time if you'd rather ship this as an API-only service.
+---
 
-## Setup
+## Project Structure
 
-```bash
-npm install
-cp .env.example .env   # then fill in MONGO_URI and JWT_SECRET at minimum
-npm run dev             # nodemon, restarts on change
-# or
-npm start
+```
+.
+├── server.js                 # Entry point: DB connection, HTTP + Socket.IO, graceful shutdown
+├── src/
+│   ├── app.js                # Express app, middleware stack, route mounting
+│   ├── config/               # Database connection, OpenAPI specification
+│   ├── controllers/          # auth, account, transaction handlers
+│   ├── middleware/           # auth, validation, sanitization, error handling
+│   ├── models/               # user, account, transaction, ledger, refreshToken, blackList
+│   ├── realtime/             # Socket.IO setup and event emitters
+│   ├── routes/               # auth, account, transaction routers
+│   ├── services/             # email, treasury account bootstrap
+│   ├── utils/                # logger, token helpers, ApiError, retry helper
+│   └── validators/           # Zod schemas
+├── public/                   # Demo console (served at /)
+├── scripts/                  # Maintenance utilities
+├── Dockerfile
+└── .env.example
 ```
 
-Open `http://localhost:3000` for the demo UI, or `http://localhost:3000/api/docs` for the API docs.
+---
 
-## Refresh token flow (what changed)
+## Installation Guide
 
-1. `POST /api/auth/login` (or `/register`) sets two httpOnly cookies —
-   `token` (access, ~15 min) and `refreshToken` (opaque random string, 30
-   days, scoped to `/api/auth`) — and also returns both in the JSON body for
-   non-browser clients.
-2. The refresh token is never stored in plaintext: only its SHA-256 hash is
-   persisted (`refreshToken` collection), alongside a `family` id.
-3. `POST /api/auth/refresh-token` looks up the presented token by hash. If
-   valid, it's marked revoked and a *new* pair is issued in the same family
-   (rotation). If a token that was already revoked is presented again,
-   that's reuse — the whole family is revoked and the client must log in
-   again.
-4. `POST /api/auth/logout` revokes the current refresh token and blacklists
-   the current access token.
+### Prerequisites
 
-## API overview
+- **Node.js** 18 or newer
+- **MongoDB** running as a **replica set** (MongoDB Atlas works out of the box)
 
-| Method | Path                                     | Notes                                    |
-|--------|-------------------------------------------|-------------------------------------------|
-| POST   | `/api/auth/register`                      |                                            |
-| POST   | `/api/auth/login`                         |                                            |
-| POST   | `/api/auth/refresh-token`                 | rotates the refresh token                 |
-| POST   | `/api/auth/logout`                        |                                            |
-| GET    | `/api/auth/me`                            | requires auth                             |
-| POST   | `/api/accounts`                           | requires auth                             |
-| GET    | `/api/accounts`                           | requires auth, includes live balances     |
-| GET    | `/api/accounts/balance/:accountId`        | requires auth                             |
-| GET    | `/api/accounts/:accountId/transactions`   | paginated statement                       |
-| POST   | `/api/transactions`                       | idempotent transfer                       |
-| POST   | `/api/transactions/deposits`              | system users only                         |
-| POST   | `/api/transactions/sandbox-topup`         | any user, **disabled in production**      |
-| GET    | `/api/transactions`                       | paginated history across your accounts    |
-| GET    | `/api/transactions/:transactionId`        |                                            |
-| GET    | `/api/transactions/export.csv`            | CSV statement                             |
-| GET    | `/health`                                 | liveness check                            |
+> MongoDB multi-document transactions are only available on replica sets. A standalone `mongod` will not work for transfers.
 
-Full request/response shapes: `/api/docs`.
+### 1. Clone and install
 
-## Concurrency & hardening fixes (round 2)
+```bash
+git clone https://github.com/<your-username>/bank-transaction.git
+cd bank-transaction
+npm install
+```
 
-A follow-up review caught five more issues, all now fixed:
+### 2. Provide a database
 
-1. **Balance check race condition** - the balance check used to run as a
-   separate read *before* the transfer's database transaction started, so
-   two simultaneous transfers from the same account could both read the
-   same starting balance and both pass. Fixed by making the check-and-debit
-   one atomic `findOneAndUpdate` (`balance: { $gte: amount }` + `$inc`),
-   which MongoDB guarantees is indivisible at the document level. This also
-   required adding a cached `balance` field to the Account model (see
-   `scripts/backfill-account-balances.js` for migrating existing data) and
-   a retry loop for the transient write conflicts MongoDB transactions
-   correctly raise when two of these atomic updates land on the same
-   document at once (`src/utils/withTransactionRetry.js`).
-2. **Refresh token rotation wasn't atomic** - the old token was marked
-   revoked *after* the new one was already issued, leaving a window where
-   two simultaneous refreshes of the same token could both succeed and fork
-   the token family. Fixed by making the revoke step itself the atomic
-   claim: `findOneAndUpdate({ tokenHash, revokedAt: null }, ...)` can only
-   succeed once, however close together two requests arrive.
-3. **Idempotency key didn't validate the payload** - replaying a key
-   returned the original transaction unconditionally, even if the amount or
-   accounts in the new request were different. Now the replayed request's
-   parameters are checked against the original; a mismatch returns `409`
-   instead of silently returning stale data. Keys are also now scoped to
-   `(initiatedBy, idempotencyKey)` instead of being globally unique, and a
-   genuine concurrent duplicate (two identical requests racing before
-   either has committed) is now handled by catching the resulting
-   duplicate-key error and returning the winner's result, instead of that
-   second request failing.
-4. **CSV export formula injection** - a transaction `note` starting with
-   `=`, `+`, `-`, or `@` could be interpreted as a live formula by
-   Excel/Sheets when the exported statement was opened (e.g.
-   `=HYPERLINK(...)`), a known CSV/spreadsheet injection class. Every
-   exported field is now formula-guarded (prefixed with `'` when it starts
-   with a formula-triggering character) and properly quoted.
-5. **Treasury account creation wasn't race-safe** - two concurrent requests
-   before the treasury account existed could both try to create the system
-   user/account; the user creation would crash with an uncaught duplicate-key
-   error, and the account had no uniqueness guarantee at all (risking two
-   separate treasury accounts with split balances). Fixed with atomic
-   upserts, a partial unique index (`role: "TREASURY"`) that makes a second
-   one impossible at the database level regardless of how many server
-   processes are running, an in-process promise guard so concurrent callers
-   in the same process share one initialization attempt, and a startup
-   warm-up call so the race window is essentially closed before real
-   traffic ever arrives.
+**Option A — MongoDB Atlas (recommended):** create a free cluster and copy its connection string.
 
-## বাংলায় ব্যাখ্যা (Explanation in Bangla)
+**Option B — Local single-node replica set with Docker:**
 
-নিচে দুই রাউন্ডেই যেসব পরিবর্তন করা হয়েছে, তার বিস্তারিত ব্যাখ্যা বাংলায় দেওয়া হলো — কোথায় পরিবর্তন হয়েছে এবং কেন দরকার ছিল।
+```bash
+docker run -d --name ledger-mongo -p 27017:27017 mongo:7 --replSet rs0
+docker exec ledger-mongo mongosh --eval "rs.initiate()"
+```
 
-### প্রথম রাউন্ড — মূল বাগ ফিক্স
+Use this connection string:
 
-**লগইনে পাসওয়ার্ড চেক হতো না** — `auth.controller.js`-এ `userLoginController` শুধু ইমেইল দিয়ে ইউজার খুঁজে টোকেন ইস্যু করে দিত, `comparePassword()` কখনো কল হতো না। মানে যেকোনো পাসওয়ার্ড দিয়ে যেকোনো রেজিস্টার্ড ইমেইল দিয়ে লগইন করা যেত — এটা সবচেয়ে বড় নিরাপত্তা ত্রুটি ছিল। এখন `user.comparePassword(password)` চেক করে, ভুল হলে ৪০১ এরর দেয়।
+```
+mongodb://127.0.0.1:27017/ledger?directConnection=true
+```
 
-**`authMiddleware`-এ ভুল ফিল্ড আর মিসিং ইম্পোর্ট** — টোকেন সাইন হতো `{ userId: ... }` দিয়ে, কিন্তু মিডলওয়্যার পড়তো `decoded.id` — কখনো মিলতো না। সাথে `tokenBlackListModel` ইম্পোর্টই করা ছিল না, তাই ব্যবহার করামাত্র ক্র্যাশ করতো। এখন `decoded.userId` ঠিকভাবে পড়া হয় এবং মডেল ইম্পোর্ট করা আছে।
+### 3. Configure the environment
 
-**মডেলের ভ্যারিয়েবল নাম মিসম্যাচ** — `blackList.model.js`-এ ডিক্লেয়ার করা হয়েছিল `tokenBlackListModel` কিন্তু এক্সপোর্ট করার সময় লেখা ছিল `tokenBlacklistModel` (case ভিন্ন) — `ReferenceError` দিয়ে সার্ভার বুট হওয়ার আগেই ক্র্যাশ করতো।
+```bash
+cp .env.example .env
+```
 
-**ট্রানজেকশনের ভেতরে হার্ডকোডেড ১০০ সেকেন্ডের sleep** — প্রতিটা ট্রানজ্যাকশন রিকোয়েস্টে প্রায় দুই মিনিট আটকে থাকতো, এটা ছিল স্পষ্টত ডিবাগিং কোড যা রয়ে গিয়েছিল। সম্পূর্ণ সরিয়ে ফেলা হয়েছে।
+Fill in at least `MONGO_URI` and `JWT_SECRET` (see [Environment Variables Setup](#environment-variables-setup)).
 
-**ব্যালান্স চেক ভুল ফিল্ডে হতো** — `fromUserAccount.balance` চেক করা হতো, কিন্তু account মডেলে `balance` নামে কোনো ফিল্ডই ছিল না (undefined-এর সাথে তুলনা)। `.status === "ACTIVE"` চেক করার কথা ছিল।
+### 4. Run
 
-**একাধিক সিনট্যাক্স এরর** — ডুপ্লিকেট ইম্পোর্ট, ব্র্যাকেট মিসিং, `function` এর বদলে `const fn(){}` লেখা, স্ট্রে ক্যারেক্টার — এগুলোর প্রতিটাই সার্ভার বুট হওয়ার আগেই ক্র্যাশ করাতো।
+```bash
+npm run dev     # development (auto-restart on change)
+npm start       # production
+```
 
-**রিফ্রেশ টোকেন সিস্টেম একদমই ছিল না** — অ্যাক্সেস টোকেন এক্সপায়ার হলে ইউজারকে আবার লগইন করতে হতো, কোনো সাইলেন্ট রিনিউয়াল ছিল না। এই রাউন্ডে যোগ করা হয়েছিল rotation + reuse detection সহ।
+| URL | Description |
+|-----|-------------|
+| `http://localhost:3000` | Demo console |
+| `http://localhost:3000/api/docs` | Interactive API documentation |
+| `http://localhost:3000/health` | Health check |
 
-### দ্বিতীয় রাউন্ড — কনকারেন্সি ও সিকিউরিটি হার্ডেনিং (এই মেসেজে)
+### Balance reconciliation utility
 
-**১. ব্যালান্স চেকের রেস কন্ডিশন** — সমস্যা ছিল: ব্যালান্স "পড়া" (read) হতো MongoDB ট্রানজ্যাকশন শুরুর *আগে*। দুইটা ট্রান্সফার রিকোয়েস্ট যদি একই মুহূর্তে আসে, দুটোই একই (পুরনো) ব্যালান্স দেখে "যথেষ্ট টাকা আছে" ভেবে এগিয়ে যেতে পারতো, ফলে অ্যাকাউন্ট নেগেটিভ ব্যালান্সে চলে যেতে পারতো। এটা fix করা হয়েছে `account.model.js`-এ একটি cached `balance` ফিল্ড যোগ করে, আর `transaction.controller.js`-এর `performTransfer`-এ চেক-এবং-ডেবিট একটাই atomic অপারেশন (`findOneAndUpdate` with `$gte` filter) দিয়ে করে — MongoDB নিশ্চয়তা দেয় যে একটা ডকুমেন্টে করা একক অপারেশন সবসময় atomic (অবিভাজ্য) হয়, তাই দুটো রিকোয়েস্টের মাঝে "ফাঁকা সময়" (race window) আর থাকে না। যেহেতু এটা একটা নতুন ফিল্ড, তাই পুরনো ডেটার জন্য `scripts/backfill-account-balances.js` মাইগ্রেশন স্ক্রিপ্টও দেওয়া হয়েছে।
+Recomputes every account balance from the immutable ledger and reports any drift from the cached value.
 
-**২. রিফ্রেশ টোকেন রোটেশন সম্পূর্ণ atomic ছিল না** — আগে পুরনো টোকেনকে revoke করা হতো নতুন টোকেন ইস্যু করার *পরে* — মাঝে একটা ফাঁক (gap) থেকে যেত যেখানে দুটো concurrent রিফ্রেশ রিকোয়েস্ট একই পুরনো টোকেন ব্যবহার করে দুটোই সফল হয়ে যেতে পারতো, যা টোকেন family-কে দুই ভাগে split করে দিত (reuse-detection এর নিরাপত্তা গ্যারান্টি দুর্বল করে)। এখন `auth.controller.js`-এ revoke করাটাই atomic claim হিসেবে কাজ করে — `findOneAndUpdate({tokenHash, revokedAt: null}, ...)` — এটা একবারই সফল হতে পারে, যত কাছাকাছি সময়েই দুটো রিকোয়েস্ট আসুক না কেন।
+```bash
+node scripts/backfill-account-balances.js --dry-run   # report only
+node scripts/backfill-account-balances.js             # report and correct
+```
 
-**৩. একই Idempotency Key দিয়ে ভিন্ন রিকোয়েস্ট পাঠানোর ঝুঁকি** — আগে একই key মিললেই পুরনো ট্রানজ্যাকশন রিটার্ন হয়ে যেত, তার প্যারামিটার (amount, accounts) নতুন রিকোয়েস্টের সাথে মিলছে কিনা তা চেক হতো না। এখন `performTransfer`-এ `assertIdempotentReplayMatches()` ফাংশন দিয়ে যাচাই করা হয় — না মিললে ৪০৯ এরর রিটার্ন হয়। সাথে `transaction.model.js`-এ ইনডেক্স পরিবর্তন করে key-কে `(initiatedBy, idempotencyKey)` এর কম্পোজিট ইউনিক করা হয়েছে (আগে গ্লোবালি ইউনিক ছিল, যা ভিন্ন ইউজারদের মধ্যে অহেতুক কনফ্লিক্ট তৈরি করতে পারতো)।
+---
 
-**৪. CSV Export-এ Formula Injection ঝুঁকি** — `note` ফিল্ডে ইউজার নিজে টেক্সট লিখতে পারে। যদি কেউ `=HYPERLINK(...)` বা `=cmd|...` এর মতো টেক্সট নোট হিসেবে লেখে, আর সেই CSV ফাইল কেউ Excel/Google Sheets-এ খোলে, তাহলে সেটা টেক্সট হিসেবে না দেখিয়ে ফর্মুলা হিসেবে *execute* হয়ে যেতে পারে (একে বলে CSV/Spreadsheet Injection, OWASP-এর পরিচিত একটা ঝুঁকি)। এখন `transaction.controller.js`-এ `csvField()` হেল্পার যোগ করা হয়েছে যা `=`, `+`, `-`, `@` দিয়ে শুরু হওয়া যেকোনো ফিল্ডের আগে একটা সিঙ্গেল-কোট (`'`) বসিয়ে দেয়, যাতে স্প্রেডশিট সফটওয়্যার সেটাকে প্লেইন টেক্সট হিসেবেই দেখায়, ফর্মুলা হিসেবে না।
+## Environment Variables Setup
 
-**৫. সিস্টেম ট্রেজারি অ্যাকাউন্ট তৈরির রেস কন্ডিশন** — `treasury.service.js`-এ আগে সিস্টেম ইউজার/অ্যাকাউন্ট "খুঁজে না পেলে তৈরি করো" এই লজিক আলাদা আলাদা `findOne` + `create` দিয়ে করা হতো, কোনো কো-অর্ডিনেশন ছাড়া। দুটো রিকোয়েস্ট একসাথে এলে (যেমন ডিপ্লয়ের পর প্রথম ডিপোজিট রিকোয়েস্ট) দুটোই "নেই" দেখে দুটোই তৈরি করতে চেষ্টা করতো — ইউজারের ক্ষেত্রে unique email index-এ ধাক্কা খেয়ে uncaught error-এ পুরো রিকোয়েস্টই ক্র্যাশ করতো, আর অ্যাকাউন্টের ক্ষেত্রে কোনো unique constraint না থাকায় দুটো আলাদা ট্রেজারি অ্যাকাউন্ট তৈরি হয়ে যেতে পারতো (ব্যালান্স ভাগ হয়ে গিয়ে হিসাব গুলিয়ে যেত)। এখন তিন স্তরে ফিক্স করা হয়েছে: (ক) `findOneAndUpdate` দিয়ে atomic upsert, (খ) `account.model.js`-এ `role: "TREASURY"` এর উপর partial unique index — যেটা ডাটাবেজ লেভেলেই নিশ্চিত করে যে দ্বিতীয় ট্রেজারি অ্যাকাউন্ট কখনোই তৈরি হতে পারবে না, (গ) একই প্রসেসের মধ্যে একাধিক কল হলে সবাই একই `initPromise` শেয়ার করে, এবং (ঘ) `server.js`-এ স্টার্টআপেই একবার warm-up কল করে রাখা হয়েছে যাতে বাস্তব ট্র্যাফিক আসার আগেই এটা তৈরি হয়ে থাকে।
+Copy `.env.example` to `.env` and set the values below. The `.env` file is git-ignored and must never be committed.
 
+### Required
 
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `MONGO_URI` | MongoDB connection string | `mongodb+srv://<user>:<password>@<cluster>.mongodb.net/ledger` |
+| `JWT_SECRET` | Secret used to sign access tokens. Use a long random value. | `openssl rand -hex 32` |
+
+### Server
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `3000` | HTTP port |
+| `NODE_ENV` | `development` | Set to `production` in deployment. Enables secure cookies and disables the sandbox top-up endpoint. |
+| `CORS_ORIGIN` | reflects request origin | Allowed origin for cross-origin clients and Socket.IO |
+| `LOG_LEVEL` | `info` | Pino log level |
+
+### Tokens
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ACCESS_TOKEN_EXPIRY` | `15m` | Access token lifetime |
+| `REFRESH_TOKEN_EXPIRY_DAYS` | `30` | Refresh token lifetime in days |
+
+### Email (optional)
+
+Email delivery is disabled automatically when these are not all set.
+
+| Variable | Description |
+|----------|-------------|
+| `EMAIL_USER` | Gmail address used as the sender |
+| `CLIENT_ID` | Google OAuth2 client ID |
+| `CLIENT_SECRET` | Google OAuth2 client secret |
+| `REFRESH_TOKEN` | Google OAuth2 refresh token for the sender account (unrelated to the API's own session refresh tokens) |
+
+### Business rules
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FRAUD_FLAG_THRESHOLD` | `100000` | Transfers at or above this amount are flagged for review (not blocked) |
+
+---
+
+## API Documentation
+
+Interactive documentation with a "Try it out" console is available at **`/api/docs`**, and the raw specification at **`/api/openapi.json`**.
+
+### Conventions
+
+- **Base path:** `/api`
+- **Content type:** `application/json`
+- **Authentication:** send the access token as `Authorization: Bearer <accessToken>`, or rely on the `token` HTTP-only cookie set at login.
+- **Errors** share a single shape:
+
+```json
+{
+  "message": "insufficient balance, current balance is 40",
+  "details": [{ "field": "amount", "message": "amount must be greater than 0" }],
+  "requestId": "b4c1a2e0-5f3d-4c0e-9a51-0d6e0b7f2c11"
+}
+```
+
+`details` appears only for validation errors. Every response carries an `x-request-id` header for tracing.
+
+| Status | Meaning |
+|--------|---------|
+| `400` | Business rule violation (insufficient funds, inactive account, self-transfer) |
+| `401` | Missing, invalid, or expired credentials |
+| `403` | Authenticated but not permitted |
+| `404` | Resource not found |
+| `409` | Conflict (duplicate email, idempotency key reused with different parameters) |
+| `422` | Request validation failed |
+| `429` | Rate limit exceeded |
+| `500` | Unexpected server error |
+
+### Authentication
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `POST` | `/auth/register` | — | Create a user and start a session |
+| `POST` | `/auth/login` | — | Log in with email and password |
+| `POST` | `/auth/refresh-token` | refresh token | Rotate the refresh token and issue a new access token |
+| `POST` | `/auth/logout` | — | Revoke the session |
+| `GET` | `/auth/me` | required | Current user profile |
+
+Register, login, and refresh are limited to 20 requests per 15 minutes per client.
+
+**Register**
+
+```http
+POST /api/auth/register
+```
+```json
+{ "name": "Ayesha Rahman", "email": "ayesha@example.com", "password": "s3cret-pass" }
+```
+
+`201 Created`
+```json
+{
+  "user": { "_id": "665f1c...", "email": "ayesha@example.com", "name": "Ayesha Rahman" },
+  "accessToken": "eyJhbGciOi...",
+  "refreshToken": "9f2b7c..."
+}
+```
+
+Both tokens are also set as HTTP-only cookies (`token`, `refreshToken`). The refresh cookie is scoped to `/api/auth`.
+
+**Login** accepts `{ "email", "password" }` and returns the same response with `200 OK`.
+
+**Refresh token**
+
+Send the `refreshToken` cookie, or provide it in the body:
+
+```json
+{ "refreshToken": "9f2b7c..." }
+```
+
+`200 OK`
+```json
+{ "accessToken": "eyJhbGciOi...", "refreshToken": "new-token..." }
+```
+
+Each refresh token is single-use. Presenting a token that was already used revokes the whole session family and returns `401`.
+
+### Accounts
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/accounts` | Create an account (optional body `{ "currency": "BDT" }`) |
+| `GET` | `/accounts` | List your accounts with live balances |
+| `GET` | `/accounts/balance/:accountId` | Balance of one account |
+| `GET` | `/accounts/:accountId/transactions` | Paginated statement. Query: `page`, `limit` (max 100), `status` |
+
+`GET /accounts` → `200 OK`
+```json
+{
+  "accounts": [
+    {
+      "_id": "665f2a...",
+      "user": "665f1c...",
+      "status": "ACTIVE",
+      "currency": "BDT",
+      "balance": 2500,
+      "createdAt": "2026-09-25T09:41:12.000Z"
+    }
+  ]
+}
+```
+
+### Transactions
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `POST` | `/transactions` | user | Transfer between accounts |
+| `GET` | `/transactions` | user | History across all your accounts. Query: `page`, `limit`, `status` |
+| `GET` | `/transactions/:transactionId` | user | A single transaction you are party to |
+| `GET` | `/transactions/export.csv` | user | Download your statement as CSV (latest 1000) |
+| `POST` | `/transactions/deposits` | system user | Credit an account from the treasury |
+| `POST` | `/transactions/sandbox-topup` | user | Fund your own account with test money. **Disabled when `NODE_ENV=production`.** |
+
+**Create a transfer**
+
+```http
+POST /api/transactions
+```
+```json
+{
+  "fromAccount": "665f2a1b3c4d5e6f7a8b9c0d",
+  "toAccount": "665f2b9e1a2b3c4d5e6f7a8b",
+  "amount": 500,
+  "idempotencyKey": "3f6d9e42-8c1a-4b7e-a0d5-2e91c7b4f6a8",
+  "note": "October rent"
+}
+```
+
+`201 Created`
+```json
+{
+  "message": "transaction completed",
+  "transaction": {
+    "_id": "665f3c...",
+    "fromAccount": "665f2a1b3c4d5e6f7a8b9c0d",
+    "toAccount": "665f2b9e1a2b3c4d5e6f7a8b",
+    "amount": 500,
+    "status": "SUCCESS",
+    "type": "TRANSFER",
+    "flagged": false,
+    "idempotencyKey": "3f6d9e42-8c1a-4b7e-a0d5-2e91c7b4f6a8"
+  }
+}
+```
+
+**Idempotency rules**
+
+- Generate a unique `idempotencyKey` (for example a UUID) for each *logical* transfer and reuse it when retrying.
+- Retrying with identical parameters returns `200 OK` with the original transaction and moves no money.
+- Reusing a key with a different amount, account, or type returns `409 Conflict`.
+- Keys are scoped to the authenticated user.
+
+**Validation:** `fromAccount` and `toAccount` must be valid account IDs, `amount` must be greater than 0, `note` is optional (max 280 characters), and you must own `fromAccount`.
+
+**Deposits and sandbox top-up** share the body `{ "toAccount", "amount", "idempotencyKey", "note" }`. Deposits require a user provisioned as a system user in the database. For development, use the sandbox top-up instead.
+
+### Real-time events
+
+Connect with Socket.IO using your access token. Each user is placed in a private room.
+
+```js
+const socket = io({ auth: { token: accessToken } });
+
+socket.on("transaction:completed", ({ transaction }) => { /* you sent money */ });
+socket.on("transaction:received",  ({ transaction }) => { /* you received money */ });
+```
+
+### Operational endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health` | Liveness check: `{ "status": "ok", "uptime": 123.4 }` |
+| `GET` | `/api/docs` | Swagger UI |
+| `GET` | `/api/openapi.json` | OpenAPI specification |
+
+---
+
+## Security Notes
+
+**Authentication & sessions**
+- Passwords are hashed with bcrypt and are never returned by the API. Login returns the same error for an unknown email and a wrong password to prevent account enumeration.
+- Access tokens are short-lived. Refresh tokens are random opaque strings, and only their SHA-256 hash is stored, so a database leak does not expose usable tokens.
+- Refresh tokens rotate on every use. The revoke-and-claim step is a single atomic database operation, so two simultaneous refreshes with the same token cannot both succeed. Replaying a used token revokes the whole session family.
+- Cookies are `httpOnly` and `sameSite=lax`, and `secure` when `NODE_ENV=production`. The refresh cookie is restricted to `/api/auth`.
+- Logged-out access tokens are blacklisted until they age out.
+
+**Financial integrity**
+- Transfers run inside MongoDB transactions, so debit, credit, ledger entries, and the transaction record commit together or not at all.
+- The balance check and debit are one atomic conditional update, which prevents overdrafts under concurrent requests. Transient write conflicts are retried automatically.
+- Idempotency keys are scoped per user and bound to the original request parameters. Concurrent duplicate requests resolve to a single transfer.
+- Ledger entries are append-only, and cached balances can be audited against the ledger at any time.
+- The treasury account is guaranteed unique by a partial unique index, independent of how many server instances are running.
+
+**Request handling**
+- All request bodies are validated with Zod; unknown operators and dotted keys are stripped to block NoSQL injection.
+- Security headers via Helmet, configurable CORS, request body size limit of 100 KB, and rate limiting on authentication endpoints.
+- CSV exports neutralize spreadsheet formula injection by prefixing values that begin with `=`, `+`, `-`, `@`, tab, or carriage return, and quote every field.
+- Error responses never expose stack traces; unexpected errors return a generic message with a `requestId` for log correlation.
+
+**Operations**
+- Never commit `.env`. It is git-ignored; only `.env.example` belongs in version control.
+- Use a long random `JWT_SECRET` and rotate any credential that has been shared or committed by mistake.
+- In production, set `NODE_ENV=production`, serve the app over HTTPS (secure cookies require it), and terminate TLS at a reverse proxy or your hosting platform. The app trusts one proxy hop for client IP detection.
+- Store secrets in your platform's secret manager or environment settings rather than in files.
+- The sandbox top-up endpoint is automatically disabled in production.
+- Transfers at or above `FRAUD_FLAG_THRESHOLD` are flagged for review. This is a simple rule, not a substitute for a dedicated fraud-detection system.
+
+---
 
 ## Deployment
 
+**Docker**
+
 ```bash
+docker build -t bank-transaction .
 docker run -p 3000:3000 --env-file .env bank-transaction
 ```
 
-Set `NODE_ENV=production` (this also disables `/api/transactions/sandbox-topup`
-and turns on cookie `secure` flags, so you'll need HTTPS in front of it — a
-reverse proxy like Caddy, Nginx, or your platform's built-in TLS termination).
+The image runs as `NODE_ENV=production` and includes a container health check against `/health`.
+
+**Platforms (Render, Railway, Fly.io, etc.)**
+
+1. Provision a MongoDB Atlas cluster and allow your host's outbound IPs.
+2. Set `MONGO_URI`, `JWT_SECRET`, and `NODE_ENV=production` in the platform's environment settings, plus `CORS_ORIGIN` if a separate frontend consumes the API.
+3. Deploy with start command `npm start`.
+
+To ship as an API-only service, delete the `public/` directory and the `express.static(...)` line in `src/app.js`.
+
+---
+
+## License
+
+ISC
