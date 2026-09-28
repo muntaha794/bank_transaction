@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Ledger — API demo</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">＄</span>
+    <div>
+      <div class="brand-name">Ledger</div>
+      <div class="brand-sub">backend demo console</div>
+    </div>
+  </div>
+  <nav class="topbar-right">
+    <a class="ghost-link" href="/api/docs" target="_blank" rel="noopener">API docs</a>
+    <span id="socketStatus" class="status-pill status-off">live: off</span>
+    <span id="userChip" class="user-chip hidden"></span>
+    <button id="logoutBtn" class="btn btn-quiet hidden">Log out</button>
+  </nav>
+</header>
+
+<main>
+
+  <!-- ===== logged out ===== -->
+  <section id="authView" class="panel auth-panel">
+    <div class="auth-copy">
+      <h1>Every function in this backend, in one place.</h1>
+      <p>This page is a thin client over the API — register, hold a balance, move
+      money between accounts, and watch the ledger update in real time. Nothing
+      here is required for the API itself to run; it exists to show the API working.</p>
+      <p class="fine-print">Sandbox top-ups are enabled in non-production environments
+      only, so you can fund an account without a real deposit.</p>
+    </div>
+
+    <div class="auth-forms">
+      <div class="tabs">
+        <button class="tab active" data-tab="login">Log in</button>
+        <button class="tab" data-tab="register">Register</button>
+      </div>
+
+      <form id="loginForm" class="tab-panel active">
+        <label>Email<input type="email" name="email" required autocomplete="email" /></label>
+        <label>Password<input type="password" name="password" required autocomplete="current-password" /></label>
+        <button class="btn btn-primary" type="submit">Log in</button>
+        <p class="form-error" data-for="loginForm"></p>
+      </form>
+
+      <form id="registerForm" class="tab-panel">
+        <label>Name<input type="text" name="name" required autocomplete="name" /></label>
+        <label>Email<input type="email" name="email" required autocomplete="email" /></label>
+        <label>Password<input type="password" name="password" required minlength="6" autocomplete="new-password" /></label>
+        <button class="btn btn-primary" type="submit">Create account</button>
+        <p class="form-error" data-for="registerForm"></p>
+      </form>
+    </div>
+  </section>
+
+  <!-- ===== logged in ===== -->
+  <section id="appView" class="hidden">
+
+    <div class="grid">
+
+      <!-- accounts -->
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Accounts</h2>
+          <button id="newAccountBtn" class="btn btn-small">+ New account</button>
+        </div>
+        <div id="accountsList" class="accounts-list"></div>
+      </div>
+
+      <!-- transfer -->
+      <div class="panel">
+        <div class="panel-head"><h2>Send money</h2></div>
+        <form id="transferForm">
+          <label>From
+            <select name="fromAccount" id="fromAccountSelect" required></select>
+          </label>
+          <label>To (account ID)
+            <input type="text" name="toAccount" placeholder="paste a recipient account id" required />
+          </label>
+          <label>Amount
+            <input type="number" name="amount" min="0.01" step="0.01" required />
+          </label>
+          <label>Note (optional)
+            <input type="text" name="note" maxlength="280" placeholder="e.g. rent" />
+          </label>
+          <button class="btn btn-primary" type="submit">Transfer</button>
+          <p class="form-error" data-for="transferForm"></p>
+          <p class="form-success" data-for="transferForm"></p>
+        </form>
+      </div>
+
+      <!-- session / security -->
+      <div class="panel">
+        <div class="panel-head"><h2>Session</h2></div>
+        <dl class="kv">
+          <dt>Access token</dt><dd id="accessTokenPreview" class="mono truncate">—</dd>
+          <dt>Expires</dt><dd id="accessTokenExpiry" class="mono">—</dd>
+        </dl>
+        <p class="fine-print">Access tokens are short-lived (15 min). The refresh token
+        (httpOnly cookie, not readable by this page's JS) is used to silently get a new
+        one — that's the flow that was missing from the original backend.</p>
+        <button id="refreshBtn" class="btn btn-small">Force refresh now</button>
+        <p class="form-error" data-for="refreshBtn"></p>
+      </div>
+
+      <!-- activity -->
+      <div class="panel panel-wide">
+        <div class="panel-head">
+          <h2>Activity</h2>
+          <div class="panel-actions">
+            <select id="statusFilter">
+              <option value="">All statuses</option>
+              <option value="SUCCESS">Success</option>
+              <option value="PENDING">Pending</option>
+              <option value="FAILED">Failed</option>
+            </select>
+            <a id="exportLink" class="btn btn-small" href="/api/transactions/export.csv">Export CSV</a>
+          </div>
+        </div>
+        <table class="ledger-table">
+          <thead>
+            <tr><th>When</th><th>Type</th><th>From</th><th>To</th><th>Amount</th><th>Status</th></tr>
+          </thead>
+          <tbody id="transactionsBody"></tbody>
+        </table>
+        <div id="pagination" class="pagination"></div>
+      </div>
+
+    </div>
+  </section>
+
+</main>
+
+<div id="toastRoot" class="toast-root"></div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
